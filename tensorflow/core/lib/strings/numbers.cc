@@ -19,9 +19,12 @@ limitations under the License.
 #include <stdio.h>
 #include <stdlib.h>
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <locale>
 #include <unordered_map>
+
+#include "double-conversion/double-conversion.h"
 
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
@@ -108,6 +111,17 @@ T locale_independent_strtonum(const char* str, const char** endptr) {
                              : s.tellg()));
   }
   return result;
+}
+
+static inline const double_conversion::StringToDoubleConverter&
+StringToFloatConverter() {
+  static const double_conversion::StringToDoubleConverter converter(
+      double_conversion::StringToDoubleConverter::ALLOW_LEADING_SPACES |
+          double_conversion::StringToDoubleConverter::ALLOW_HEX |
+          double_conversion::StringToDoubleConverter::ALLOW_TRAILING_SPACES |
+          double_conversion::StringToDoubleConverter::ALLOW_CASE_INSENSIBILITY,
+      0., 0., "inf", "nan");
+  return converter;
 }
 
 }  // namespace
@@ -318,26 +332,30 @@ bool safe_strtou32(StringPiece str, uint32* value) {
   return true;
 }
 
-bool safe_strtof(const char* str, float* value) {
-  const char* endptr;
-  *value = locale_independent_strtonum<float>(str, &endptr);
-  while (isspace(*endptr)) ++endptr;
-  // Ignore range errors from strtod/strtof.
-  // The values it returns on underflow and
-  // overflow are the right fallback in a
-  // robust setting.
-  return *str != '\0' && *endptr == '\0';
+bool safe_strtof(StringPiece str, float* value) {
+  int processed_characters_count = -1;
+  auto len = str.size();
+
+  // If string length exceeds buffer size or int max, fail.
+  if (len >= kFastToBufferSize) return false;
+  if (len > std::numeric_limits<int>::max()) return false;
+
+  *value = StringToFloatConverter().StringToFloat(
+      str.data(), static_cast<int>(len), &processed_characters_count);
+  return processed_characters_count > 0;
 }
 
-bool safe_strtod(const char* str, double* value) {
-  const char* endptr;
-  *value = locale_independent_strtonum<double>(str, &endptr);
-  while (isspace(*endptr)) ++endptr;
-  // Ignore range errors from strtod/strtof.
-  // The values it returns on underflow and
-  // overflow are the right fallback in a
-  // robust setting.
-  return *str != '\0' && *endptr == '\0';
+bool safe_strtod(StringPiece str, double* value) {
+  int processed_characters_count = -1;
+  auto len = str.size();
+
+  // If string length exceeds buffer size or int max, fail.
+  if (len >= kFastToBufferSize) return false;
+  if (len > std::numeric_limits<int>::max()) return false;
+
+  *value = StringToFloatConverter().StringToDouble(
+      str.data(), static_cast<int>(len), &processed_characters_count);
+  return processed_characters_count > 0;
 }
 
 size_t FloatToBuffer(float value, char* buffer) {
@@ -373,8 +391,8 @@ string FpToString(Fprint fp) {
 
 bool StringToFp(const string& s, Fprint* fp) {
   char junk;
-  uint64 result;
-  if (sscanf(s.c_str(), "%llx%c", &result, &junk) == 1) {
+  uint64_t result;
+  if (sscanf(s.c_str(), "%" SCNx64 "%c", &result, &junk) == 1) {
     *fp = result;
     return true;
   } else {

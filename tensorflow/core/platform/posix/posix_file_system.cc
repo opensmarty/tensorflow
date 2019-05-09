@@ -16,9 +16,10 @@ limitations under the License.
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>
-#if !defined(__APPLE__)
+#if defined(__linux__)
 #include <sys/sendfile.h>
 #endif
 #include <sys/stat.h>
@@ -52,12 +53,26 @@ class PosixRandomAccessFile : public RandomAccessFile {
       : filename_(fname), fd_(fd) {}
   ~PosixRandomAccessFile() override { close(fd_); }
 
+  Status Name(StringPiece* result) const override {
+    *result = filename_;
+    return Status::OK();
+  }
+
   Status Read(uint64 offset, size_t n, StringPiece* result,
               char* scratch) const override {
     Status s;
     char* dst = scratch;
     while (n > 0 && s.ok()) {
-      ssize_t r = pread(fd_, dst, n, static_cast<off_t>(offset));
+      // Some platforms, notably macs, throw EINVAL if pread is asked to read
+      // more than fits in a 32-bit integer.
+      size_t requested_read_length;
+      if (n > INT32_MAX) {
+        requested_read_length = INT32_MAX;
+      } else {
+        requested_read_length = n;
+      }
+      ssize_t r =
+          pread(fd_, dst, requested_read_length, static_cast<off_t>(offset));
       if (r > 0) {
         dst += r;
         n -= r;
@@ -91,7 +106,7 @@ class PosixWritableFile : public WritableFile {
     }
   }
 
-  Status Append(const StringPiece& data) override {
+  Status Append(StringPiece data) override {
     size_t r = fwrite(data.data(), 1, data.size(), file_);
     if (r != data.size()) {
       return IOError(filename_, errno);
@@ -115,11 +130,27 @@ class PosixWritableFile : public WritableFile {
     return Status::OK();
   }
 
+  Status Name(StringPiece* result) const override {
+    *result = filename_;
+    return Status::OK();
+  }
+
   Status Sync() override {
     Status s;
     if (fflush(file_) != 0) {
       s = IOError(filename_, errno);
     }
+    return s;
+  }
+
+  Status Tell(int64* position) override {
+    Status s;
+    *position = ftell(file_);
+
+    if (*position == -1) {
+      s = IOError(filename_, errno);
+    }
+
     return s;
   }
 };
@@ -240,11 +271,14 @@ Status PosixFileSystem::DeleteFile(const string& fname) {
 }
 
 Status PosixFileSystem::CreateDir(const string& name) {
-  Status result;
-  if (mkdir(TranslateName(name).c_str(), 0755) != 0) {
-    result = IOError(name, errno);
+  string translated = TranslateName(name);
+  if (translated.empty()) {
+    return errors::AlreadyExists(name);
   }
-  return result;
+  if (mkdir(translated.c_str(), 0755) != 0) {
+    return IOError(name, errno);
+  }
+  return Status::OK();
 }
 
 Status PosixFileSystem::DeleteDir(const string& name) {

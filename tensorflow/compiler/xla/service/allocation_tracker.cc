@@ -17,37 +17,49 @@ limitations under the License.
 
 #include <utility>
 
+#include "absl/memory/memory.h"
+#include "absl/strings/str_cat.h"
 #include "tensorflow/compiler/xla/map_util.h"
-#include "tensorflow/compiler/xla/ptr_util.h"
-#include "tensorflow/compiler/xla/service/device_memory_allocator.h"
 #include "tensorflow/compiler/xla/service/transfer_manager.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/util.h"
-#include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
+#include "tensorflow/stream_executor/device_memory_allocator.h"
 
 namespace xla {
 
 StatusOr<GlobalDataHandle> AllocationTracker::Register(
-    ShapedBuffer shaped_buffer, const string& tag) {
+    ScopedShapedBuffer shaped_buffer, const string& tag) {
   tensorflow::mutex_lock lock(mutex_);
   VLOG(2) << "Register";
-  std::vector<ShapedBuffer> replicated_buffers;
+  std::vector<ScopedShapedBuffer> replicated_buffers;
   replicated_buffers.emplace_back(std::move(shaped_buffer));
   return RegisterInternal(std::move(replicated_buffers), tag);
 }
 
 StatusOr<GlobalDataHandle> AllocationTracker::RegisterReplicatedBuffers(
-    std::vector<ShapedBuffer> replicated_buffers, const string& tag) {
+    std::vector<ScopedShapedBuffer> replicated_buffers, const string& tag) {
   tensorflow::mutex_lock lock(mutex_);
   VLOG(2) << "RegisterReplicatedBuffers";
   return RegisterInternal(std::move(replicated_buffers), tag);
 }
 
+// ReleaseIfScopedShapedBuffer lets RegisterInternal<ShapedBufferTy>(b) call
+// b.release() if b is a ScopedShapedBuffer, or otherwise pass b through
+// unmodified.
+static ShapedBuffer ReleaseIfScopedShapedBuffer(ShapedBuffer b) { return b; }
+static ShapedBuffer ReleaseIfScopedShapedBuffer(ScopedShapedBuffer b) {
+  return b.release();
+}
+
+template <typename ShapedBufferTy>
 StatusOr<GlobalDataHandle> AllocationTracker::RegisterInternal(
-    std::vector<ShapedBuffer> replicated_buffers, const string& tag) {
+    std::vector<ShapedBufferTy> replicated_buffers, const string& tag) {
+  static_assert(std::is_same<ShapedBufferTy, ShapedBuffer>::value ||
+                    std::is_same<ShapedBufferTy, ScopedShapedBuffer>::value,
+                "ShapedBufferTy must be ShapedBuffer or ScopedShapedBuffer.");
   VLOG(2) << "RegisterInternal("
           << "tag: \"" << tag << "\" with " << replicated_buffers.size()
           << " shaped_buffers.";
@@ -57,25 +69,30 @@ StatusOr<GlobalDataHandle> AllocationTracker::RegisterInternal(
       return InvalidArgument(
           "AllocationTracker for platform %s cannot register buffer from "
           "platform %s",
-          backend_->platform()->Name().c_str(),
-          shaped_buffer.platform()->Name().c_str());
+          backend_->platform()->Name(), shaped_buffer.platform()->Name());
     }
   }
 
   int64 handle = next_handle_++;
   for (auto& shaped_buffer : replicated_buffers) {
     std::vector<ShapeIndex> shape_indices;
-    ShapeUtil::ForEachSubshape(shaped_buffer.on_device_shape(),
-                               [this, &shape_indices](const Shape& /*subshape*/,
-                                                      const ShapeIndex& index) {
-                                 shape_indices.push_back(index);
-                               });
+    ShapeUtil::ForEachSubshape(
+        shaped_buffer.on_device_shape(),
+        [&](const Shape& /*subshape*/, const ShapeIndex& index) {
+          shape_indices.push_back(index);
+        });
+    // Add shaped_buffer's buffers to opaque_to_allocation_map_, which owns
+    // them.
     for (const ShapeIndex& index : shape_indices) {
       AddAllocationOrIncrementRefCount(shaped_buffer.buffer(index),
                                        shaped_buffer.device_ordinal());
     }
+    // If ShapedBufferTy is ScopedShapedBuffer, release the ScopedShapedBuffer
+    // into a regular ShapedBuffer, which is stored in
+    // handle_to_shaped_buffers_.
     handle_to_shaped_buffers_[handle].emplace_back(
-        MakeUnique<ShapedBuffer>(std::move(shaped_buffer)));
+        absl::make_unique<ShapedBuffer>(
+            ReleaseIfScopedShapedBuffer(std::move(shaped_buffer))));
   }
 
   GlobalDataHandle result;
@@ -84,7 +101,7 @@ StatusOr<GlobalDataHandle> AllocationTracker::RegisterInternal(
   return result;
 }
 
-tensorflow::Status AllocationTracker::Unregister(const GlobalDataHandle& data) {
+Status AllocationTracker::Unregister(const GlobalDataHandle& data) {
   tensorflow::mutex_lock lock(mutex_);
   VLOG(2) << "Unregister("
           << "handle: " << data.handle() << ")";
@@ -92,32 +109,28 @@ tensorflow::Status AllocationTracker::Unregister(const GlobalDataHandle& data) {
                       ResolveInternal(data));
   for (const auto& shaped_buffer : replicated_buffers) {
     std::vector<ShapeIndex> shape_indices;
-    ShapeUtil::ForEachSubshape(shaped_buffer->on_device_shape(),
-                               [this, &shape_indices](const Shape& /*subshape*/,
-                                                      const ShapeIndex& index) {
-                                 shape_indices.push_back(index);
-                               });
+    ShapeUtil::ForEachSubshape(
+        shaped_buffer->on_device_shape(),
+        [&shape_indices](const Shape& /*subshape*/, const ShapeIndex& index) {
+          shape_indices.push_back(index);
+        });
     for (const ShapeIndex& index : shape_indices) {
       TF_RETURN_IF_ERROR(DecrementRefCount(shaped_buffer->buffer(index),
                                            shaped_buffer->device_ordinal()));
     }
   }
-  return Reset(data);
-}
-
-Status AllocationTracker::Reset(const GlobalDataHandle& data) {
   // Keep a nullptr as a tombstone for unregistered handles. This enables
   // better error messages. That is, "handle has been deallocated" versus
   // "handle does not exist".
   auto it = handle_to_shaped_buffers_.find(data.handle());
   if (it == handle_to_shaped_buffers_.end()) {
-    return NotFound("no allocation record for global data handle: %lld",
+    return NotFound("no allocation record for global data handle: %d",
                     data.handle());
   }
   for (auto& shaped_buffer : it->second) {
     shaped_buffer.reset();
   }
-  return tensorflow::Status::OK();
+  return Status::OK();
 }
 
 StatusOr<std::vector<GlobalDataHandle>> AllocationTracker::DeconstructTuple(
@@ -129,13 +142,13 @@ StatusOr<std::vector<GlobalDataHandle>> AllocationTracker::DeconstructTuple(
   // We only need to care about replica id 0 here, since the GlobalDataHandle is
   // the same for all buffers across replicas.
   const ShapedBuffer* shaped_buffer = replicated_buffers[0];
-  if (!ShapeUtil::IsTuple(shaped_buffer->on_host_shape())) {
-    return InvalidArgument("global data handle %lld is not a tuple",
+  if (!shaped_buffer->on_host_shape().IsTuple()) {
+    return InvalidArgument("global data handle %d is not a tuple",
                            data.handle());
   }
   // If the on-host representation is a tuple, then the on-device one should be
   // as well.
-  TF_RET_CHECK(ShapeUtil::IsTuple(shaped_buffer->on_device_shape()));
+  TF_RET_CHECK(shaped_buffer->on_device_shape().IsTuple());
 
   if (ShapeUtil::IsNestedTuple(shaped_buffer->on_device_shape())) {
     return Unimplemented("Deconstructing nested tuples is not implemented.");
@@ -152,7 +165,7 @@ StatusOr<std::vector<GlobalDataHandle>> AllocationTracker::DeconstructTuple(
     element_buffer.set_buffer(shaped_buffer->buffer(/*index=*/{i}),
                               /*index=*/{});
     std::vector<ShapedBuffer> replicated_buffers;
-    replicated_buffers.emplace_back(std::move(element_buffer));
+    replicated_buffers.push_back(std::move(element_buffer));
     TF_ASSIGN_OR_RETURN(
         GlobalDataHandle element_handle,
         RegisterInternal(std::move(replicated_buffers), "deconstructed tuple"));
@@ -163,13 +176,13 @@ StatusOr<std::vector<GlobalDataHandle>> AllocationTracker::DeconstructTuple(
 }
 
 StatusOr<std::vector<const ShapedBuffer*>> AllocationTracker::Resolve(
-    const GlobalDataHandle& data) {
+    const GlobalDataHandle& data) const {
   tensorflow::mutex_lock lock(mutex_);
   return AllocationTracker::ResolveInternal(data);
 }
 
 StatusOr<const ShapedBuffer*> AllocationTracker::ResolveForReplica(
-    const GlobalDataHandle& data, int replica_id) {
+    const GlobalDataHandle& data, int replica_id) const {
   tensorflow::mutex_lock lock(mutex_);
   TF_ASSIGN_OR_RETURN(std::vector<const ShapedBuffer*> replicated_buffers,
                       ResolveInternal(data));
@@ -183,18 +196,18 @@ StatusOr<const ShapedBuffer*> AllocationTracker::ResolveForReplica(
 }
 
 StatusOr<std::vector<const ShapedBuffer*>> AllocationTracker::ResolveInternal(
-    const GlobalDataHandle& data) {
+    const GlobalDataHandle& data) const {
   VLOG(2) << "resolve:" << data.handle();
   auto it = handle_to_shaped_buffers_.find(data.handle());
   if (it == handle_to_shaped_buffers_.end()) {
-    return NotFound("no allocation record for global data handle: %lld",
+    return NotFound("no allocation record for global data handle: %d",
                     data.handle());
   }
   std::vector<const ShapedBuffer*> replicated_buffers;
   for (const auto& shaped_buffer : it->second) {
     if (shaped_buffer == nullptr) {
-      return InvalidArgument(
-          "global data handle %lld was previously deallocated", data.handle());
+      return InvalidArgument("global data handle %d was previously deallocated",
+                             data.handle());
     }
     replicated_buffers.push_back(shaped_buffer.get());
   }
@@ -207,8 +220,10 @@ void AllocationTracker::AddAllocationOrIncrementRefCount(
   AllocationMap& allocation_map = opaque_to_allocation_map_[device_ordinal];
   auto it = allocation_map.find(device_memory.opaque());
   if (it == allocation_map.end()) {
-    allocation_map[device_memory.opaque()] = {device_memory, device_ordinal,
-                                              /*ref_count=*/1};
+    allocation_map[device_memory.opaque()] = {
+        se::OwningDeviceMemory(device_memory, device_ordinal,
+                               backend_->memory_allocator()),
+        /*ref_count=*/1};
   } else {
     it->second.ref_count++;
   }
@@ -222,13 +237,12 @@ Status AllocationTracker::DecrementRefCount(se::DeviceMemoryBase device_memory,
   Allocation& allocation = it->second;
   TF_RET_CHECK(allocation.ref_count >= 1);
   if (allocation.ref_count == 1) {
-    TF_RETURN_IF_ERROR(backend_->memory_allocator()->Deallocate(
-        device_ordinal, &device_memory));
+    allocation.device_memory.Free();
     allocation_map.erase(it);
   } else {
     allocation.ref_count--;
   }
-  return tensorflow::Status::OK();
+  return Status::OK();
 }
 
 }  // namespace xla

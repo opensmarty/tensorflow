@@ -41,6 +41,10 @@ struct CheckNumericsLaunch {
   void Run(const GPUDevice& d, const T* data, int size,
            int abnormal_detected[2]);
 };
+
+extern template struct CheckNumericsLaunch<Eigen::half>;
+extern template struct CheckNumericsLaunch<float>;
+extern template struct CheckNumericsLaunch<double>;
 #endif
 
 namespace {
@@ -139,7 +143,7 @@ class CheckNumericsOp<GPUDevice, T> : public AsyncOpKernel {
     OP_REQUIRES_ASYNC(context, stream != nullptr,
                       errors::Internal("No GPU stream available."), done);
 
-    perftools::gputools::DeviceMemoryBase abnormal_detected_ptr(
+    se::DeviceMemoryBase abnormal_detected_ptr(
         abnormal_detected.flat<int>().data(),
         abnormal_detected.flat<int>().size());
     stream->ThenMemset32(&abnormal_detected_ptr, 0,
@@ -174,8 +178,8 @@ class CheckNumericsOp<GPUDevice, T> : public AsyncOpKernel {
     TensorReference abnormal_detected_ref(abnormal_detected);
     auto check_cb = [this, stream, abnormal_detected_ref,
                      abnormal_detected_host, context, done]() {
-      ::perftools::gputools::cuda::ScopedActivateExecutorContext
-          scoped_activation{stream->parent()};
+      se::cuda::ScopedActivateExecutorContext scoped_activation{
+          stream->parent()};
       auto abnormal_detected_host_flat = abnormal_detected_host.flat<int>();
       int is_nan = abnormal_detected_host_flat(0);
       int is_inf = abnormal_detected_host_flat(1);

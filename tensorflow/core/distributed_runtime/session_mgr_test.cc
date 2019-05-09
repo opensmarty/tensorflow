@@ -19,6 +19,7 @@ limitations under the License.
 #include "tensorflow/core/distributed_runtime/worker_env.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/platform/test.h"
+#include "tensorflow/core/protobuf/cluster.pb.h"
 
 namespace tensorflow {
 
@@ -45,11 +46,9 @@ class SessionMgrTest : public ::testing::Test {
   SessionMgrTest()
       : mgr_(&env_, "/job:mnist/replica:0/task:0",
              std::unique_ptr<WorkerCacheInterface>(), factory_) {
-    Device* device =
-        FakeDevice::MakeCPU("/job:mnist/replica:0/task:0/device:fakecpu:0")
-            .release();
-    env_.local_devices = {device};
-    device_mgr_.reset(new DeviceMgr(env_.local_devices));
+    device_mgr_ = absl::make_unique<DeviceMgr>(
+        FakeDevice::MakeCPU("/job:mnist/replica:0/task:0/device:fakecpu:0"));
+    env_.local_devices = device_mgr_->ListDevices();
     env_.device_mgr = device_mgr_.get();
   }
 
@@ -74,6 +73,34 @@ TEST_F(SessionMgrTest, CreateSessionSimple) {
   TF_EXPECT_OK(mgr_.WorkerSessionForSession(session_handle, &session));
   EXPECT_NE(nullptr, session) << "Session for " << session_handle << "was null";
   EXPECT_NE(mgr_.LegacySession(), session);
+  TF_EXPECT_OK(mgr_.DeleteSession(session_handle));
+}
+
+TEST_F(SessionMgrTest, CreateSessionClusterDefWorkerName) {
+  ServerDef server_def;
+  server_def.set_job_name("worker");
+  server_def.set_task_index(3);
+  auto job = server_def.mutable_cluster()->add_job();
+  job->set_name("worker");
+  job->mutable_tasks()->insert({3, "localhost:3333"});
+
+  string session_handle = "test_session_handle";
+  TF_EXPECT_OK(mgr_.CreateSession(session_handle, server_def, true));
+  std::shared_ptr<WorkerSession> session;
+  TF_EXPECT_OK(mgr_.WorkerSessionForSession(session_handle, &session));
+  EXPECT_NE(nullptr, session) << "Session for " << session_handle << "was null";
+  EXPECT_EQ("/job:worker/replica:0/task:3", session->worker_name);
+  TF_EXPECT_OK(mgr_.DeleteSession(session_handle));
+}
+
+TEST_F(SessionMgrTest, CreateSessionDefaultWorkerName) {
+  ServerDef server_def;
+  string session_handle = "test_session_handle";
+  TF_EXPECT_OK(mgr_.CreateSession(session_handle, server_def, true));
+  std::shared_ptr<WorkerSession> session;
+  TF_EXPECT_OK(mgr_.WorkerSessionForSession(session_handle, &session));
+  EXPECT_NE(nullptr, session) << "Session for " << session_handle << "was null";
+  EXPECT_EQ("/job:mnist/replica:0/task:0", session->worker_name);
   TF_EXPECT_OK(mgr_.DeleteSession(session_handle));
 }
 
@@ -113,7 +140,6 @@ TEST_F(SessionMgrTest, CreateSessionIsolateSessionState) {
 }
 
 TEST_F(SessionMgrTest, LegacySession) {
-  ServerDef server_def;
   string session_handle = "";
   std::shared_ptr<WorkerSession> session;
   TF_EXPECT_OK(mgr_.WorkerSessionForSession(session_handle, &session));
@@ -123,7 +149,6 @@ TEST_F(SessionMgrTest, LegacySession) {
 }
 
 TEST_F(SessionMgrTest, UnknownSessionHandle) {
-  ServerDef server_def;
   string session_handle = "unknown_session_handle";
   std::shared_ptr<WorkerSession> session;
   Status s = mgr_.WorkerSessionForSession(session_handle, &session);

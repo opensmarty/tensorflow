@@ -26,12 +26,13 @@ ExecutableRunOptions& ExecutableRunOptions::set_device_ordinal(
 int ExecutableRunOptions::device_ordinal() const { return device_ordinal_; }
 
 ExecutableRunOptions& ExecutableRunOptions::set_allocator(
-    DeviceMemoryAllocator* allocator) {
+    stream_executor::DeviceMemoryAllocator* allocator) {
   allocator_ = allocator;
   return *this;
 }
 
-DeviceMemoryAllocator* ExecutableRunOptions::allocator() const {
+stream_executor::DeviceMemoryAllocator* ExecutableRunOptions::allocator()
+    const {
   return allocator_;
 }
 
@@ -45,15 +46,14 @@ stream_executor::Stream* ExecutableRunOptions::stream() const {
   return stream_;
 }
 
-ExecutableRunOptions& ExecutableRunOptions::set_inter_op_thread_pool(
-    tensorflow::thread::ThreadPool* inter_op_thread_pool) {
-  inter_op_thread_pool_ = inter_op_thread_pool;
+ExecutableRunOptions& ExecutableRunOptions::set_host_to_device_stream(
+    stream_executor::Stream* stream) {
+  host_to_device_stream_ = stream;
   return *this;
 }
 
-tensorflow::thread::ThreadPool* ExecutableRunOptions::inter_op_thread_pool()
-    const {
-  return inter_op_thread_pool_;
+stream_executor::Stream* ExecutableRunOptions::host_to_device_stream() const {
+  return host_to_device_stream_;
 }
 
 ExecutableRunOptions& ExecutableRunOptions::set_intra_op_thread_pool(
@@ -78,7 +78,7 @@ ExecutionProfile* ExecutableRunOptions::execution_profile() const {
 }
 
 ExecutableRunOptions& ExecutableRunOptions::set_device_assignment(
-    DeviceAssignment* device_assignment) {
+    const DeviceAssignment* device_assignment) {
   device_assignment_ = device_assignment;
   return *this;
 }
